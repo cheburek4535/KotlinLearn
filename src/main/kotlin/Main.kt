@@ -67,6 +67,42 @@ fun getEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
     }
 }
 
+class EndpointBuilder(val name: String) {
+    var url: String = ""
+    var timeoutMs: Long = 2000
+    var attempts = 3
+    var intervalSec: Int = 5
+    var expectedStatus: Int = 200
+    fun build(): EndpointConf {
+        require(url.isNotBlank()) {"поле url пустое для конфига для '$name'"}
+        return EndpointConf(
+            name = name,
+            url = url,
+            timeoutMS = TimeoutMs(timeoutMs),
+            attempts = attempts,
+            intervalSec = intervalSec,
+            expectedStatus = expectedStatus
+        )
+    }
+}
+
+//fun endpoint(name: String, block: EndpointBuilder.() -> Unit): EndpointConf {
+//    val builder = EndpointBuilder(name)
+//    builder.block()
+//    return builder.build()
+//}
+fun endpoint(name: String, block: EndpointBuilder.() -> Unit) {
+    EndpointBuilder(name).apply(block).build()
+}
+
+
+class Monitor {
+    private val endpointsList = listOf(
+        endpoint("healthcheck") {url="https://httpbin.org/status/200"},
+        endpoint("json-api") {url="https://jsonplaceholder.typicode.com/todos/1"},
+        endpoint("postman-echo") {url="https://postman-echo.com/get"}
+    )
+}
 fun main(args: Array<String>) {
     val client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
 
