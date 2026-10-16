@@ -67,6 +67,11 @@ fun getEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
     }
 }
 
+
+@DslMarker
+annotation class  PulseDsl
+
+@PulseDsl
 class EndpointBuilder(val name: String) {
     var url: String = ""
     var timeoutMs: Long = 2000
@@ -91,21 +96,35 @@ class EndpointBuilder(val name: String) {
 //    builder.block()
 //    return builder.build()
 //}
-fun endpoint(name: String, block: EndpointBuilder.() -> Unit) {
+fun endpoint(name: String, block: EndpointBuilder.() -> Unit): EndpointConf =
     EndpointBuilder(name).apply(block).build()
-}
 
 
-class Monitor {
-    private val endpointsList = listOf(
-        endpoint("healthcheck") {url="https://httpbin.org/status/200"},
-        endpoint("json-api") {url="https://jsonplaceholder.typicode.com/todos/1"},
-        endpoint("postman-echo") {url="https://postman-echo.com/get"}
-    )
+class Monitor(val endpoints: List<EndpointConf>) {
+
 }
+
+@PulseDsl
+class MonitorBuilder {
+    private val endpoints = mutableListOf<EndpointConf>()
+
+    fun endpoint(name: String, block: EndpointBuilder.() -> Unit) {
+        endpoints.add(EndpointBuilder(name).apply(block).build())
+    }
+    fun build(): Monitor = Monitor(endpoints.toList())
+}
+
+fun monitor(block: MonitorBuilder.() -> Unit): Monitor =
+    MonitorBuilder().apply(block).build()
+
+
 fun main(args: Array<String>) {
     val client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
 
+    val monitor = monitor {
+        endpoint("github") {url="https://github.com"}
+        endpoint("google") {url="https://google.com"}
+    }
     val endpoints = listOf(
         EndpointConf("healthcheck", "https://httpbin.org/status/200"),
         EndpointConf("json-api", "https://jsonplaceholder.typicode.com/todos/1"),
