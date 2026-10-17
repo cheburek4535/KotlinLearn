@@ -2,16 +2,17 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.TimeoutException
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimedValue
 import kotlin.time.measureTimedValue
-
-@JvmInline
-value class TimeoutMs(val value: Long)
 
 data class EndpointConf(
     val name: String,
     val url: String,
-    val timeoutMS: TimeoutMs = TimeoutMs(2000),
+    val timeoutMS: Long = 2000,
     val attempts: Int = 3,
     val intervalSec: Int = 5,
     val expectedStatus: Int = 200
@@ -41,32 +42,6 @@ sealed interface Response{
     ) : Response
 }
 
-fun getEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
-    return try {
-        val url = endpointConf.url
-        val request = HttpRequest.newBuilder().uri(URI.create(url)).build()
-
-        val timed = measureTimedValue {
-            client.send(request, HttpResponse.BodyHandlers.ofString())
-        }
-
-        Response.Success(
-            endpointConf.name,
-            Instant.now().toEpochMilli(),
-            timed.value.statusCode(),
-            timed.duration.inWholeMilliseconds,
-            timed.value.toString()
-
-        )
-    } catch (e: Exception) {
-        Response.Failure(
-            endpointConf.name,
-            Instant.now().toEpochMilli(),
-            e
-        )
-    }
-}
-
 
 @DslMarker
 annotation class  PulseDsl
@@ -83,7 +58,7 @@ class EndpointBuilder(val name: String) {
         return EndpointConf(
             name = name,
             url = url,
-            timeoutMS = TimeoutMs(timeoutMs),
+            timeoutMS = timeoutMs,
             attempts = attempts,
             intervalSec = intervalSec,
             expectedStatus = expectedStatus
@@ -91,27 +66,86 @@ class EndpointBuilder(val name: String) {
     }
 }
 
-//fun endpoint(name: String, block: EndpointBuilder.() -> Unit): EndpointConf {
-//    val builder = EndpointBuilder(name)
-//    builder.block()
-//    return builder.build()
-//}
-fun endpoint(name: String, block: EndpointBuilder.() -> Unit): EndpointConf =
-    EndpointBuilder(name).apply(block).build()
+
+class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
+    fun pingAll(print: Boolean = true): List<Response> {
+        return endpoints.map { endpoint ->
+            val resp: Response = pingEndpoint(endpoint, client)
+            if (print) {
+                when (resp) {
+                    is Response.Success -> println("Эндпоинт успешно пингнут")
+                    is Response.Failure -> println("Пинг эндпоинта провален с ошибкой ${resp.error}")
+                    is Response.Degraded -> println("Пинг эндпоинта произошел плохо")
+                }
+            }
+            resp
+        }
+    }
+    fun ping(name: String): Response? {
+        val endpoint = endpoints.find{it.name == name} ?: return null
+        return pingEndpoint(endpoint, client)
+    }
+
+    private fun pingEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
+        return try {
+            val url = endpointConf.url
+            val request = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofMillis(endpointConf.timeoutMS)).build()
+            var timed: TimedValue<HttpResponse<String>>? = null
+
+            for (attempt in 1..endpointConf.attempts) {
+                try {
+                    timed = measureTimedValue {
+                        client.send(request, HttpResponse.BodyHandlers.ofString())
+                    }
+                    break
+                } catch (e: TimeoutException) {
+                    println("Исключение $e, таймаут")
+                    if (attempt < endpointConf.attempts) {
+                        Thread.sleep(endpointConf.intervalSec.seconds.inWholeMilliseconds)
+                    }
+                }
+            }
 
 
-class Monitor(val endpoints: List<EndpointConf>) {
+            when {
+                timed == null || timed.value.statusCode() != endpointConf.expectedStatus -> Response.Degraded(
+                    endpointName =endpointConf.name,
+                    timestamp=Instant.now().toEpochMilli(),
+                    latencyMs = if (timed==null) endpointConf.attempts * endpointConf.timeoutMS else timed.duration.inWholeMilliseconds,
+                    reason= if (timed==null) "не удалось дойти до сайта" else "статус ${timed.value.statusCode()} не совпадает с ожидаемым"
+                )
+                else -> Response.Success(
+                    endpointConf.name,
+                    Instant.now().toEpochMilli(),
+                    timed.value.statusCode(),
+                    timed.duration.inWholeMilliseconds,
+                    timed.value.toString()
 
+                )
+            }
+
+        } catch (e: Exception) {
+            Response.Failure(
+                endpointConf.name,
+                Instant.now().toEpochMilli(),
+                e
+            )
+        }
+    }
 }
 
 @PulseDsl
 class MonitorBuilder {
     private val endpoints = mutableListOf<EndpointConf>()
+    private var client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
 
     fun endpoint(name: String, block: EndpointBuilder.() -> Unit) {
         endpoints.add(EndpointBuilder(name).apply(block).build())
     }
-    fun build(): Monitor = Monitor(endpoints.toList())
+    fun setClient(client: HttpClient) {
+        this.client = client
+    }
+    fun build(): Monitor = Monitor(endpoints.toList(), client)
 }
 
 fun monitor(block: MonitorBuilder.() -> Unit): Monitor =
@@ -119,13 +153,12 @@ fun monitor(block: MonitorBuilder.() -> Unit): Monitor =
 
 
 fun main(args: Array<String>) {
-    val client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
-
     val monitor = monitor {
         endpoint("github") {url="https://github.com"}
         endpoint("google") {url="https://google.com"}
+        setClient(HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build())
     }
-    val endpoints = listOf(
+    /*val endpoints = listOf(
         EndpointConf("healthcheck", "https://httpbin.org/status/200"),
         EndpointConf("json-api", "https://jsonplaceholder.typicode.com/todos/1"),
         EndpointConf("postman-echo", "https://postman-echo.com/get"),
@@ -142,20 +175,10 @@ fun main(args: Array<String>) {
         EndpointConf("very-slow", "https://httpbin.org/delay/10", TimeoutMs(15000), attempts = 1, intervalSec = 15),
         EndpointConf("flaky-500", "https://httpbin.org/status/500", attempts = 5, intervalSec = 2),
         EndpointConf("redirect-loop", "https://httpbin.org/redirect/5", TimeoutMs(5000), attempts = 3),
-        EndpointConf("weird-status", "https://httpbin.org/status/418", expectedStatus = 418, attempts = 3)
+        EndpointConf("weird-status", "https://httpbin.org/status/418", expectedStatus = 418, attempts = 3)*/
 
-    )
-    val result: List<Response> = endpoints.map { endpoint ->
-        println("Ping endpoint: ${endpoint.url}")
+    //)
 
-        val resp: Response = getEndpoint(endpoint, client)
-        when (resp) {
-            is Response.Success -> {println("Successful pinged endpoint: ${endpoint.url}! Status: ${resp.statusCode}, Latency: ${resp.responseTimeMs}")}
-            is Response.Failure -> {println("Failed pinging endpoint: ${endpoint.url}! Error: ${resp.error}")}
-            is Response.Degraded -> {println("Degraded endpoint: ${endpoint.url}. reason: ${resp.reason}")}
-        }
-        resp
-    }
-
-    print(result)
+    println(monitor.ping("github"))
+    print(monitor.pingAll())
 }
