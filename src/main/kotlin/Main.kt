@@ -2,9 +2,12 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 import java.time.Duration
 import java.time.Instant
-import java.util.concurrent.TimeoutException
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimedValue
 import kotlin.time.measureTimedValue
@@ -68,6 +71,9 @@ class EndpointBuilder(val name: String) {
 
 
 class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
+    private val endpointsByName = endpoints.associateBy{it.name}
+    private val pingResults = mutableListOf<Response>()
+
     fun pingAll(print: Boolean = true): List<Response> {
         return endpoints.map { endpoint ->
             val resp: Response = pingEndpoint(endpoint, client)
@@ -82,11 +88,12 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
         }
     }
     fun ping(name: String): Response? {
-        val endpoint = endpoints.find{it.name == name} ?: return null
+        val endpoint = endpointsByName[name] ?: run {println("эндпоинт с именем $name не найден в списке"); return null}
         return pingEndpoint(endpoint, client)
     }
 
     private fun pingEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
+        println("Пингуем эндпоинт ${endpointConf.name}")
         return try {
             val url = endpointConf.url
             val request = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofMillis(endpointConf.timeoutMS)).build()
@@ -98,7 +105,7 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
                         client.send(request, HttpResponse.BodyHandlers.ofString())
                     }
                     break
-                } catch (e: TimeoutException) {
+                } catch (e: HttpTimeoutException) {
                     println("Исключение $e, таймаут")
                     if (attempt < endpointConf.attempts) {
                         Thread.sleep(endpointConf.intervalSec.seconds.inWholeMilliseconds)
@@ -108,18 +115,20 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
 
 
             when {
-                timed == null || timed.value.statusCode() != endpointConf.expectedStatus -> Response.Degraded(
+                timed == null || timed.value.statusCode() != endpointConf.expectedStatus || timed.duration.inWholeMilliseconds > endpointConf.timeoutMS * 0.8 -> Response.Degraded(
                     endpointName =endpointConf.name,
                     timestamp=Instant.now().toEpochMilli(),
                     latencyMs = if (timed==null) endpointConf.attempts * endpointConf.timeoutMS else timed.duration.inWholeMilliseconds,
-                    reason= if (timed==null) "не удалось дойти до сайта" else "статус ${timed.value.statusCode()} не совпадает с ожидаемым"
+                    reason= if (timed==null) "не удалось дойти до сайта"
+                    else if (timed.duration.inWholeMilliseconds > endpointConf.timeoutMS * 0.8) "долгое ожидание ${timed.duration.inWholeMilliseconds}мс"
+                    else "статус ${timed.value.statusCode()} не совпадает с ожидаемым"
                 )
                 else -> Response.Success(
                     endpointConf.name,
                     Instant.now().toEpochMilli(),
                     timed.value.statusCode(),
                     timed.duration.inWholeMilliseconds,
-                    timed.value.toString()
+                    timed.value.body().take(100)
 
                 )
             }
@@ -130,21 +139,35 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
                 Instant.now().toEpochMilli(),
                 e
             )
-        }
+        }.also {response -> pingResults.add(response)}
+    }
+
+    fun getFailures(): List<Response.Failure> = pingResults.filterIsInstance<Response.Failure>()
+    fun getDegraded(): List<Response.Degraded> = pingResults.filterIsInstance<Response.Degraded>()
+    fun getSuccessful(): List<Response.Success> = pingResults.filterIsInstance<Response.Success>()
+
+    fun getReport(): String {
+        var result = "отчет о анализе эндпоинтов (${Instant.now().atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"))})\n"
+        var failed = getFailures()
+        var degraded = getDegraded()
+        var successful = getSuccessful()
+        result += "Успешные: ${successful.joinToString { it.endpointName }} | кол-во: ${successful.size}\nПроваленые: ${failed.joinToString { it.endpointName }} | кол-во ${failed.size}\nНесостоятельные: ${degraded.joinToString { it.endpointName }} | кол-во ${degraded.size}"
+        result += "Процент успешных: ${(successful.size / (failed.size + successful.size + degraded.size)) * 100}%"
+        result += "Среднее время ответа: ${"TODO"}"
+
+        return result
     }
 }
 
 @PulseDsl
 class MonitorBuilder {
     private val endpoints = mutableListOf<EndpointConf>()
-    private var client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
+    var client = HttpClient.newBuilder().build()
 
     fun endpoint(name: String, block: EndpointBuilder.() -> Unit) {
         endpoints.add(EndpointBuilder(name).apply(block).build())
     }
-    fun setClient(client: HttpClient) {
-        this.client = client
-    }
+
     fun build(): Monitor = Monitor(endpoints.toList(), client)
 }
 
@@ -156,29 +179,25 @@ fun main(args: Array<String>) {
     val monitor = monitor {
         endpoint("github") {url="https://github.com"}
         endpoint("google") {url="https://google.com"}
-        setClient(HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build())
+        endpoint("healthcheck") { url = "https://httpbin.org/status/200" }
+        endpoint("json-api") { url = "https://jsonplaceholder.typicode.com/todos/1" }
+        endpoint("postman-echo") { url = "https://postman-echo.com/get" }
+        endpoint("github-api") { url = "https://api.github.com"; timeoutMs = 3000; attempts = 2 }
+        endpoint("httpbin-get") { url = "https://httpbin.org/get"; timeoutMs = 1500; attempts = 4 }
+        endpoint("bad-domain") { url = "https://this-domain-definitely-does-not-exist-12345.com" }
+        endpoint("wrong-port") { url = "http://localhost:9999"; timeoutMs = 1000; attempts = 1 }
+        endpoint("dns-fail") { url = "https://nonexistent.invalid" }
+        endpoint("unresolvable-host") { url = "http://no-such-host.local"; timeoutMs = 1000; attempts = 2 }
+        endpoint("dead-url") { url = "https://httpbin.org/status/404"; expectedStatus = 200 }
+        endpoint("slow-but-ok") { url = "https://httpbin.org/delay/5"; timeoutMs = 8000; attempts = 2; intervalSec = 10 }
+        endpoint("very-slow") { url = "https://httpbin.org/delay/10"; timeoutMs = 15000; attempts = 1; intervalSec = 15 }
+        endpoint("flaky-500") { url = "https://httpbin.org/status/500"; attempts = 5; intervalSec = 2 }
+        endpoint("redirect-loop") { url = "https://httpbin.org/redirect/5"; timeoutMs = 5000; attempts = 3 }
+        endpoint("weird-status") { url = "https://httpbin.org/status/418"; expectedStatus = 418; attempts = 3 }
+
+        client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
     }
-    /*val endpoints = listOf(
-        EndpointConf("healthcheck", "https://httpbin.org/status/200"),
-        EndpointConf("json-api", "https://jsonplaceholder.typicode.com/todos/1"),
-        EndpointConf("postman-echo", "https://postman-echo.com/get"),
-        EndpointConf("github-api", "https://api.github.com", TimeoutMs(3000), attempts = 2),
-        EndpointConf("httpbin-get", "https://httpbin.org/get", TimeoutMs(1500), attempts = 4),
 
-        EndpointConf("bad-domain", "https://this-domain-definitely-does-not-exist-12345.com"),
-        EndpointConf("wrong-port", "http://localhost:9999", TimeoutMs(1000), attempts = 1),
-        EndpointConf("dns-fail", "https://nonexistent.invalid"),
-        EndpointConf("unresolvable-host", "http://no-such-host.local", TimeoutMs(1000), attempts = 2),
-        EndpointConf("dead-url", "https://httpbin.org/status/404", expectedStatus = 200),
-
-        EndpointConf("slow-but-ok", "https://httpbin.org/delay/5", TimeoutMs(8000), attempts = 2, intervalSec = 10),
-        EndpointConf("very-slow", "https://httpbin.org/delay/10", TimeoutMs(15000), attempts = 1, intervalSec = 15),
-        EndpointConf("flaky-500", "https://httpbin.org/status/500", attempts = 5, intervalSec = 2),
-        EndpointConf("redirect-loop", "https://httpbin.org/redirect/5", TimeoutMs(5000), attempts = 3),
-        EndpointConf("weird-status", "https://httpbin.org/status/418", expectedStatus = 418, attempts = 3)*/
-
-    //)
-
-    println(monitor.ping("github"))
-    print(monitor.pingAll())
+    monitor.pingAll()
+    println("\n\n${monitor.getReport()}")
 }
