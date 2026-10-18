@@ -8,6 +8,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import kotlin.math.round
+import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimedValue
 import kotlin.time.measureTimedValue
@@ -147,15 +149,27 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
     fun getSuccessful(): List<Response.Success> = pingResults.filterIsInstance<Response.Success>()
 
     fun getReport(): String {
-        var result = "отчет о анализе эндпоинтов (${Instant.now().atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"))})\n"
-        var failed = getFailures()
-        var degraded = getDegraded()
-        var successful = getSuccessful()
-        result += "Успешные: ${successful.joinToString { it.endpointName }} | кол-во: ${successful.size}\nПроваленые: ${failed.joinToString { it.endpointName }} | кол-во ${failed.size}\nНесостоятельные: ${degraded.joinToString { it.endpointName }} | кол-во ${degraded.size}"
-        result += "Процент успешных: ${(successful.size / (failed.size + successful.size + degraded.size)) * 100}%"
-        result += "Среднее время ответа: ${"TODO"}"
+        val failed = getFailures()
+        val degraded = getDegraded()
+        val successful = getSuccessful()
+        val avgLatencySuccessful = successful.map{it.responseTimeMs}.average().takeIf {!it.isNaN()}?.roundToInt() ?: 0
+        val avgLatencyDegraded = degraded.map {it.latencyMs}.average().takeIf{!it.isNaN()}?.roundToInt() ?: 0
+        val fastest = successful.minByOrNull { it.responseTimeMs }
+        val slowest = successful.maxByOrNull { it.responseTimeMs }
 
-        return result
+        return """
+            отчет о анализе эндпоинтов (${Instant.now().atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss"))})
+            Успешные: ${successful.joinToString { it.endpointName }} | кол-во: ${successful.size}
+            Проваленые: ${failed.joinToString { it.endpointName }} | кол-во ${failed.size}
+            Несостоятельные: ${degraded.joinToString { it.endpointName }} | кол-во ${degraded.size}
+            Процент успешных: ${round((successful.size.toDouble() / (failed.size + successful.size + degraded.size)) * 100)}%
+            Среднее время ответа у успешных: $avgLatencySuccessful
+            Среднее время ответа несостоятельных: $avgLatencyDegraded
+            Самый медленный успешный эндпоинт: ${slowest?.let {"${slowest.endpointName} (${slowest.responseTimeMs})мс"} ?: "Нет данных"}
+            Самый быстрый успешный эндпоинт:  ${fastest?.let{"${fastest.endpointName} (${fastest.responseTimeMs})мс"} ?: "Нет данных"}
+            
+            """.trimIndent()
+
     }
 }
 
