@@ -1,3 +1,4 @@
+import kotlinx.coroutines.*
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -5,7 +6,6 @@ import java.net.http.HttpResponse
 import java.net.http.HttpTimeoutException
 import java.time.Duration
 import java.time.Instant
-import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlin.math.round
@@ -73,29 +73,29 @@ class EndpointBuilder(val name: String) {
 
 
 class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
+
     private val endpointsByName = endpoints.associateBy{it.name}
     private val pingResults = mutableListOf<Response>()
 
-    fun pingAll(print: Boolean = true): List<Response> {
-        return endpoints.map { endpoint ->
-            val resp: Response = pingEndpoint(endpoint, client)
-            if (print) {
-                when (resp) {
-                    is Response.Success -> println("Эндпоинт успешно пингнут")
-                    is Response.Failure -> println("Пинг эндпоинта провален с ошибкой ${resp.error}")
-                    is Response.Degraded -> println("Пинг эндпоинта произошел плохо")
+    suspend fun pingAll(): List<Response> {
+
+        val results: List<Response> = coroutineScope {
+            endpoints.map { endpoint ->
+                async(Dispatchers.IO) {
+                    pingEndpoint(endpoint, client)
                 }
-            }
-            resp
+            }.awaitAll()
         }
+        pingResults.addAll(results)
+        return results
     }
-    fun ping(name: String): Response? {
-        val endpoint = endpointsByName[name] ?: run {println("эндпоинт с именем $name не найден в списке"); return null}
-        return pingEndpoint(endpoint, client)
+    suspend fun ping(name: String): Response? {
+        val endpoint = endpointsByName[name] ?: run {Log.error { "эндпоинт с именем $name не найден в списке"}; return null}
+        return pingEndpoint(endpoint, client).also {pingResults.add(it)}
     }
 
-    private fun pingEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
-        println("Пингуем эндпоинт ${endpointConf.name}")
+    private suspend fun pingEndpoint(endpointConf: EndpointConf, client: HttpClient): Response {
+        Log.info {"Пингуем эндпоинт ${endpointConf.name}"}
         return try {
             val url = endpointConf.url
             val request = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofMillis(endpointConf.timeoutMS)).build()
@@ -108,14 +108,12 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
                     }
                     break
                 } catch (e: HttpTimeoutException) {
-                    println("Исключение $e, таймаут")
+                    Log.warn{"Исключение $e, таймаут"}
                     if (attempt < endpointConf.attempts) {
-                        Thread.sleep(endpointConf.intervalSec.seconds.inWholeMilliseconds)
+                        delay(endpointConf.intervalSec.seconds)
                     }
                 }
             }
-
-
             when {
                 timed == null || timed.value.statusCode() != endpointConf.expectedStatus || timed.duration.inWholeMilliseconds > endpointConf.timeoutMS * 0.8 -> Response.Degraded(
                     endpointName =endpointConf.name,
@@ -141,7 +139,7 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
                 Instant.now().toEpochMilli(),
                 e
             )
-        }.also {response -> pingResults.add(response)}
+        }
     }
 
     fun getFailures(): List<Response.Failure> = pingResults.filterIsInstance<Response.Failure>()
@@ -163,8 +161,8 @@ class Monitor(val endpoints: List<EndpointConf>, val client: HttpClient) {
             Проваленые: ${failed.joinToString { it.endpointName }} | кол-во ${failed.size}
             Несостоятельные: ${degraded.joinToString { it.endpointName }} | кол-во ${degraded.size}
             Процент успешных: ${round((successful.size.toDouble() / (failed.size + successful.size + degraded.size)) * 100)}%
-            Среднее время ответа у успешных: $avgLatencySuccessful
-            Среднее время ответа несостоятельных: $avgLatencyDegraded
+            Среднее время ответа у успешных: $avgLatencySuccessful мс
+            Среднее время ответа несостоятельных: $avgLatencyDegraded мс
             Самый медленный успешный эндпоинт: ${slowest?.let {"${slowest.endpointName} (${slowest.responseTimeMs})мс"} ?: "Нет данных"}
             Самый быстрый успешный эндпоинт:  ${fastest?.let{"${fastest.endpointName} (${fastest.responseTimeMs})мс"} ?: "Нет данных"}
             
@@ -189,7 +187,8 @@ fun monitor(block: MonitorBuilder.() -> Unit): Monitor =
     MonitorBuilder().apply(block).build()
 
 
-fun main(args: Array<String>) {
+fun main() = runBlocking {
+    Log.debug {"Приложение запцщено"}
     val monitor = monitor {
         endpoint("github") {url="https://github.com"}
         endpoint("google") {url="https://google.com"}
@@ -208,6 +207,7 @@ fun main(args: Array<String>) {
         endpoint("flaky-500") { url = "https://httpbin.org/status/500"; attempts = 5; intervalSec = 2 }
         endpoint("redirect-loop") { url = "https://httpbin.org/redirect/5"; timeoutMs = 5000; attempts = 3 }
         endpoint("weird-status") { url = "https://httpbin.org/status/418"; expectedStatus = 418; attempts = 3 }
+        endpoint("youtube") {url = "https://youtube.com"}
 
         client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
     }
